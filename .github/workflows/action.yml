@@ -1,0 +1,154 @@
+name: Excel Upload Workflow
+
+on:
+  push:
+    branches:
+      - manager
+    paths:
+      - 'files/*.xlsx'
+
+permissions: 
+  issues: write
+  contents: read
+
+env:
+  TEMP_FOLDER_DATA: /tmp/xlsx2rss-data
+
+jobs:
+  main:
+    runs-on: ubuntu-latest
+    
+    outputs:
+      commit-files: ${{ steps.commit-file.outputs.files }}
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-url: ${{ steps.artifact.outputs.artifact-url }}
+      issue-number: ${{ steps.create-issue.outputs.issue-number }}
+      issue-comment-body: ${{ steps.wait-issue.outputs.comment-body }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.1.1
+        with:
+          python-version: '3.8'
+          cache: 'pip'
+
+      - name: Install Python Dependancies
+        run: pip install -r requirements.txt
+
+      - name: Get Commit File
+        id: commit-file
+        uses: ./actions/get-commit-file
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          file-name: '*.xlsx'
+
+      - name: Make temp folder
+        run: mkdir ${{ env.TEMP_FOLDER_DATA }}
+
+      - name: Run make_data code
+        env:
+          PASS_KEY: "${{ secrets.PASS_KEY }}"
+          FILE_NAME: "${{ fromJson(steps.commit-file.outputs.files)[0].origin_name }}"
+          TEMP_FOLDER_DATA: "${{ env.TEMP_FOLDER_DATA }}"
+        run: |
+          python make_data.py
+          
+      - name: Upload artifact
+        id: artifact
+        uses: actions/upload-artifact@v4.3.4
+        with:
+          name: xlsx2rss-data
+          path: ${{ env.TEMP_FOLDER_DATA }}
+
+      - name: Create approval markdown
+        env:
+          FILE_ORIGIN_NAME: ${{ fromJson(steps.commit-file.outputs.files)[0].name }}
+          UPLOAD_FILE_NAME: ${{ fromJson(steps.commit-file.outputs.files)[0].origin_name }}
+          UPLOAD_FILE_URL: ${{ fromJson(steps.commit-file.outputs.files)[0].url.blob }}
+          ARTIFACT_URL: ${{ steps.artifact.outputs.artifact-url }}
+          TEMP_FOLDER_DATA: ${{ env.TEMP_FOLDER_DATA }}
+        run: |
+          python create_template.py
+
+      - name: Create approval issue
+        id: create-issue
+        uses: ./actions/create-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          issue-title: "[Github Action] 파일 승인 요청"
+          issue-body-url: ./templates/request_approve.tmp.md
+          label: 승인요청
+
+      - name: Alert ISSUE
+        run: |
+          echo "------------------------------------------------------------------------"
+          echo "|"
+          echo "| 이슈 생성: ${{ steps.create-issue.outputs.issue-url }}"
+          echo "|"
+          echo "------------------------------------------------------------------------"
+          echo -e "\n\nWaiting..."
+
+      - name: Wait for issue closed
+        id: wait-issue
+        uses: ./actions/wait-for-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ steps.create-issue.outputs.issue-number }}
+          interval-wait-time: 3000
+          max-try: 600
+
+  approved:
+    needs: main
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    if: contains(fromJson('["O", "o", "ok", "OK", "Ok", "oK"]'), needs.main.outputs.issue-comment-body)
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+          
+      - name: Download artifact
+        uses: actions/download-artifact@v4.1.8
+        with:
+          name: xlsx2rss-data
+          path: ${{ env.TEMP_FOLDER_DATA }}
+
+      - name: Add issue comment
+        uses: ./actions/add-issue-comment
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          comment: "승인되었습니다"
+          issue-number: ${{ needs.main.outputs.issue-number }}
+          # state: closed
+          # state-reason: completed
+
+      - name: Upload Server
+        uses: ./actions/send-lohas-req
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          artifact-id: ${{ needs.main.outputs.artifact-id }}
+          jwt-secret: ${{ secrets.JWT_SECRET }}
+          issue-number: ${{ needs.main.outputs.issue-number }}
+          api-url: ${{ secrets.API_URL }}
+
+  denied:
+    needs: main
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: ${{ ! contains(fromJson('["O", "o", "ok", "OK", "Ok", "oK"]'), needs.main.outputs.issue-comment-body) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+          
+      - name: Add issue comment
+        uses: ./actions/add-issue-comment
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          comment: "승인 거부되었습니다"
+          issue-number: ${{ needs.main.outputs.issue-number }}
+          state: closed
+          state-reason: not_planned
